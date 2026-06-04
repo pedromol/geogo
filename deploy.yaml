@@ -31,7 +31,7 @@ spec:
               memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /8.8.8.8
+              path: /healthz
               port: http
             initialDelaySeconds: 2
             periodSeconds: 5
@@ -39,7 +39,7 @@ spec:
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /8.8.8.8
+              path: /healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
