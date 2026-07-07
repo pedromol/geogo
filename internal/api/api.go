@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -58,6 +59,8 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.handleHealthcheck)
 	mux.HandleFunc("/access/", a.handleAccess)
+	mux.HandleFunc("/forward-auth", a.handleForwardAuth)
+	mux.HandleFunc("/forward-auth/", a.handleForwardAuth)
 	mux.HandleFunc("/info/", a.handleInfo)
 	return mux
 }
@@ -109,6 +112,58 @@ func (a *App) lookup(ip netip.Addr) (geoip.Data, error) {
 	return geoip.Lookup(a.db, ip)
 }
 
+func parseForwardedForIP(r *http.Request) (string, netip.Addr, bool) {
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		first := strings.TrimSpace(strings.Split(xff, ",")[0])
+		if ip, err := netip.ParseAddr(first); err == nil {
+			return first, ip, true
+		}
+	}
+
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-Ip")); xri != "" {
+		if ip, err := netip.ParseAddr(xri); err == nil {
+			return xri, ip, true
+		}
+	}
+
+	if cfi := strings.TrimSpace(r.Header.Get("Cf-Connecting-Ip")); cfi != "" {
+		if ip, err := netip.ParseAddr(cfi); err == nil {
+			return cfi, ip, true
+		}
+	}
+
+	if fwd := strings.TrimSpace(r.Header.Get("Forwarded")); fwd != "" {
+		for _, part := range strings.Split(fwd, ";") {
+			k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if !ok || strings.ToLower(strings.TrimSpace(k)) != "for" {
+				continue
+			}
+			v = strings.TrimSpace(v)
+			v = strings.Trim(v, "\"")
+			v = strings.TrimPrefix(v, "[")
+			v = strings.TrimSuffix(v, "]")
+			if host, _, err := net.SplitHostPort(v); err == nil {
+				v = host
+			}
+			if ip, err := netip.ParseAddr(v); err == nil {
+				return v, ip, true
+			}
+		}
+	}
+
+	host := strings.TrimSpace(r.RemoteAddr)
+	if host == "" {
+		return "", netip.Addr{}, false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return host, ip, true
+	}
+	return "", netip.Addr{}, false
+}
+
 func (a *App) handleAccess(w http.ResponseWriter, r *http.Request) {
 	if !requireMethodGet(w, r) {
 		return
@@ -117,6 +172,37 @@ func (a *App) handleAccess(w http.ResponseWriter, r *http.Request) {
 	raw, ip, status, msg := parseIPFromPath(r.URL.Path, "/access/", "/access/{IP-ADDRESS}")
 	if status != 0 {
 		writeJSON(w, status, ErrorResponse{Error: msg})
+		return
+	}
+
+	data, err := a.lookup(ip)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: fmt.Sprintf("mmdb lookup failed: %v", err)})
+		return
+	}
+
+	if !allow.Check(data.Continent, data.Country, data.City, a.allowed) {
+		writeJSON(w, http.StatusForbidden, ErrorResponse{Error: "ip not allowed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, IsAllowedResponse{IP: raw, Allowed: true})
+}
+
+func (a *App) handleForwardAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+	if r.URL.Path != "/forward-auth" && r.URL.Path != "/forward-auth/" {
+		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
+		return
+	}
+
+	raw, ip, ok := parseForwardedForIP(r)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "missing or invalid client ip"})
 		return
 	}
 
